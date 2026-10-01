@@ -367,10 +367,12 @@ document.addEventListener("click", (e) => {
   } else if (act === "add-sample" && state.samples.length < MAX_SAMPLES) {
     state.samples.push({ background: "#ffffff", target: "#ffffff" });
     render();
+    markTransitionStaleness();
     scheduleSolve(0);
   } else if (act === "remove-sample" && state.samples.length > MIN_SAMPLES) {
     state.samples.splice(i, 1);
     render();
+    markTransitionStaleness();
     scheduleSolve(0);
   } else if (act === "add-relation" && state.relations.length < MAX_RELATIONS) {
     const first = state.layers[0]?.id || "";
@@ -752,7 +754,8 @@ document.addEventListener("change", (e) => {
     const other = transitionState.order.findIndex((id, p) => p !== pos && id === t.value);
     transitionState.order[pos] = t.value;
     if (other !== -1 && prev) transitionState.order[other] = prev;
-    renderTransitionControls();
+    renderTransitionControls(lastSolveResult);
+    markTransitionStaleness();
   } else if (act === "infer-pick") {
     const id = t.dataset.id;
     if (t.checked) inferState.picks.add(id);
@@ -926,6 +929,7 @@ function applyInferResult() {
   inferState.appliedSig = inferSignature();
   renderInferResult(inferState.result);
   render();
+  markTransitionStaleness();
   runSolve();
 }
 
@@ -938,6 +942,8 @@ const transitionState = {
   resultKey: "",    // 结果产生时的输入指纹
   _idSig: "",
   _bestSse: null,   // 最近一次求解的最优总误差（用于默认上限与提示）
+  inflightId: 0,        // 最近一次规划请求序号；0 表示当前无在途请求
+  inflightSig: "",      // 最近一次规划请求发出时的输入指纹
 };
 
 const elTransitionOrder = $("#transitionOrder");
@@ -1067,6 +1073,15 @@ function resetTransitionOrder() {
 }
 
 function markTransitionStaleness() {
+  // 输入指纹变化时：在途请求（及其响应）立即失效，不能再改动结果 / 错误 / 加载状态。
+  // 这里仅结束加载态；旧响应返回后会在响应守卫处被丢弃。
+  if (transitionState.inflightId !== 0 &&
+      transitionSignature() !== transitionState.inflightSig) {
+    transitionState.inflightId = 0;
+    transitionState.inflightSig = "";
+    elTransitionStatus.textContent = "";
+    elTransitionStatus.className = "status";
+  }
   if (!transitionState.result) return;
   const fresh = transitionSignature() === transitionState.resultKey;
   const old = elTransitionResult.querySelector(".stale-note");
@@ -1085,6 +1100,16 @@ function transitionResultFresh() {
   return transitionSignature() === transitionState.resultKey;
 }
 
+// 响应守卫：只有「最近一次请求」且「发出后参与输入未再变化」的响应可以落地，
+// 较早或已失效请求的成功 / HTTP 错误 / 连接异常一律忽略，不得触碰当前结果、错误提示或加载状态。
+function transitionResponseCurrent(reqId, reqSig) {
+  return (
+    transitionState.inflightId === reqId &&
+    transitionState.inflightSig === reqSig &&
+    transitionSignature() === reqSig
+  );
+}
+
 async function runTransition() {
   const limit = effectiveTransitionLimit();
   const payload = {
@@ -1094,6 +1119,12 @@ async function runTransition() {
     currentOrder: transitionState.order,
     transitionLimit: limit,
   };
+  // 记录本次请求序号与发出时的输入指纹；连续规划或输入变化时，
+  // 旧请求即便后返回也不会覆盖较新结果（见 transitionResponseCurrent）。
+  const reqId = ++transitionState.inflightId;
+  const reqSig = transitionSignature();
+  transitionState.inflightSig = reqSig;
+
   elTransitionStatus.textContent = "规划中…";
   elTransitionStatus.className = "status busy";
   elTransitionErrors.hidden = true;
@@ -1105,6 +1136,9 @@ async function runTransition() {
       body: JSON.stringify(payload),
     });
     const data = await resp.json();
+    if (!transitionResponseCurrent(reqId, reqSig)) return;
+    transitionState.inflightId = 0;
+    transitionState.inflightSig = "";
     elTransitionStatus.textContent = "";
     elTransitionStatus.className = "status";
     if (!resp.ok) {
@@ -1112,9 +1146,12 @@ async function runTransition() {
       return;
     }
     transitionState.result = data;
-    transitionState.resultKey = transitionSignature();
+    transitionState.resultKey = reqSig;
     renderTransitionResult(data);
   } catch (err) {
+    if (!transitionResponseCurrent(reqId, reqSig)) return;
+    transitionState.inflightId = 0;
+    transitionState.inflightSig = "";
     elTransitionStatus.textContent = "";
     elTransitionStatus.className = "status";
     showTransitionErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
@@ -1620,6 +1657,7 @@ function appendReviewSample() {
   markSuggestStaleness();
   renderSuggestControls();
   markReviewStaleness();
+  markTransitionStaleness();
   runSolve();
 }
 
