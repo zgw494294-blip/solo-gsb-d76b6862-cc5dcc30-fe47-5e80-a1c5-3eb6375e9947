@@ -752,7 +752,7 @@ document.addEventListener("change", (e) => {
     const other = transitionState.order.findIndex((id, p) => p !== pos && id === t.value);
     transitionState.order[pos] = t.value;
     if (other !== -1 && prev) transitionState.order[other] = prev;
-    renderTransitionControls();
+    if (lastSolveResult) renderTransitionControls(lastSolveResult);
   } else if (act === "infer-pick") {
     const id = t.dataset.id;
     if (t.checked) inferState.picks.add(id);
@@ -938,6 +938,9 @@ const transitionState = {
   resultKey: "",    // 结果产生时的输入指纹
   _idSig: "",
   _bestSse: null,   // 最近一次求解的最优总误差（用于默认上限与提示）
+  inflightToken: 0, // 规划请求序号；仅序号最新的响应可能落库
+  inflightKey: "",  // 最新在途请求发起时的输入指纹
+  inputEpoch: 0,    // 参与规划的输入代数；输入每变化一次 +1，旧在途响应随之作废
 };
 
 const elTransitionOrder = $("#transitionOrder");
@@ -974,10 +977,7 @@ function syncTransitionPanel(solveResult) {
     transitionState._idSig = idSig;
     transitionState.order = [...solveResult.order];
     transitionState.limit = null;
-    transitionState.result = null;
-    transitionState.resultKey = "";
-    elTransitionResult.innerHTML = "";
-    elTransitionErrors.hidden = true;
+    invalidateTransitionResult();
   } else {
     // 集合未变：补齐 / 剔除，保持当前实际顺序始终是全部图层的一个排列
     transitionState.order = transitionState.order.filter((id) => layerSet.has(id));
@@ -1066,18 +1066,42 @@ function resetTransitionOrder() {
   renderTransitionControls(r);
 }
 
-function markTransitionStaleness() {
-  if (!transitionState.result) return;
-  const fresh = transitionSignature() === transitionState.resultKey;
-  const old = elTransitionResult.querySelector(".stale-note");
-  if (!fresh && !old) {
-    const note = document.createElement("div");
-    note.className = "stale-note";
-    note.textContent = "参与规划的输入已变化，以下交换步骤已失效，请重新规划。";
-    elTransitionResult.prepend(note);
-  } else if (fresh && old) {
-    old.remove();
+// 参与规划的输入变化（图层 / 样本 / 先后关系 / 当前叠序 / 上限）后立即调用：
+// 旧步骤当场作废，尚在等待的旧输入请求也一并作废，其任何响应（成功 / HTTP 错误 /
+// 连接异常）都不得再改动当前结果、错误提示或加载状态。
+function invalidateTransitionResult() {
+  transitionState.inputEpoch += 1;
+  transitionState.inflightToken += 1; // 在途旧请求的序号即刻落后
+  transitionState.inflightKey = "";
+  transitionState.result = null;
+  transitionState.resultKey = "";
+  if (elTransitionStatus.classList.contains("busy")) {
+    // 本地主动结束等待：旧请求已作废，不能留下永远转圈的「规划中…」
+    elTransitionStatus.textContent = "";
+    elTransitionStatus.className = "status";
   }
+  renderTransitionInvalidNote();
+}
+
+function renderTransitionInvalidNote() {
+  if (elTransitionResult.querySelector(".stale-note")) return;
+  const note = document.createElement("div");
+  note.className = "stale-note";
+  note.textContent = "参与规划的输入已变化，旧交换步骤已失效，正在等待的旧请求结果也不再采用；请按当前输入重新规划。";
+  elTransitionResult.innerHTML = "";
+  elTransitionResult.appendChild(note);
+}
+
+function markTransitionStaleness() {
+  // 最新请求仍在加载中、但其对应输入已经变化：立即作废并结束加载；
+  // 加载已结束后迟到的旧响应由 runTransition 中的序号 / 指纹比对拦截。
+  const pendingStale =
+    elTransitionStatus.classList.contains("busy") &&
+    transitionState.inflightToken !== 0 &&
+    transitionState.inflightKey !== transitionSignature();
+  if (!transitionState.result && !pendingStale) return;
+  if (transitionState.result && transitionSignature() === transitionState.resultKey) return;
+  invalidateTransitionResult();
 }
 
 function transitionResultFresh() {
@@ -1094,6 +1118,18 @@ async function runTransition() {
     currentOrder: transitionState.order,
     transitionLimit: limit,
   };
+  // 记录本次请求的序号、输入代数与发起时的输入指纹；只有「序号最新、输入代数
+  // 未推进且输入指纹未变化」的响应才允许更新当前规划、错误提示或加载状态。
+  const token = ++transitionState.inflightToken;
+  const requestEpoch = transitionState.inputEpoch;
+  const requestKey = transitionSignature();
+  transitionState.inflightKey = requestKey;
+
+  const responseStillValid = () =>
+    token === transitionState.inflightToken &&
+    requestEpoch === transitionState.inputEpoch &&
+    requestKey === transitionSignature();
+
   elTransitionStatus.textContent = "规划中…";
   elTransitionStatus.className = "status busy";
   elTransitionErrors.hidden = true;
@@ -1105,18 +1141,26 @@ async function runTransition() {
       body: JSON.stringify(payload),
     });
     const data = await resp.json();
+    // 已有更新的请求发出，或请求对应输入已变化：旧响应彻底忽略，
+    // 不改当前步骤、错误提示，也不动「规划中…」加载状态（由最新请求负责收尾）。
+    if (!responseStillValid()) return;
     elTransitionStatus.textContent = "";
     elTransitionStatus.className = "status";
+    transitionState.inflightToken = 0;
+    transitionState.inflightKey = "";
     if (!resp.ok) {
       showTransitionErrors(data.errors || [{ scope: "form", message: "规划失败" }]);
       return;
     }
     transitionState.result = data;
-    transitionState.resultKey = transitionSignature();
+    transitionState.resultKey = requestKey;
     renderTransitionResult(data);
   } catch (err) {
+    if (!responseStillValid()) return; // 旧请求的连接异常同样全部忽略
     elTransitionStatus.textContent = "";
     elTransitionStatus.className = "status";
+    transitionState.inflightToken = 0;
+    transitionState.inflightKey = "";
     showTransitionErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
   }
 }
